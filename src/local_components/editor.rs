@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::component::Component;
+use crate::component::LocalComponent;
 
 pub struct Editor {
     mode: Mode,
@@ -17,15 +17,13 @@ impl Editor {
     }
 }
 
-impl Component for Editor {
+impl LocalComponent for Editor {
     async fn run(&mut self, mut cx: crate::component::Context) -> Result<()> {
         cx.call::<String, ()>("core.print", Some("editor online".to_string()))
-            .await;
+            .await?;
 
-        let result = cx.call::<(), String>("core.getinfo", None).await?;
+        let result = cx.call::<(), String>("core.getinfo", None).await;
         println!("{result:?}");
-
-        cx.call::<(), ()>("core.quit", None).await?;
 
         Ok(())
     }

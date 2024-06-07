@@ -4,7 +4,8 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
-use uuid::Uuid;
+
+use crate::component::ComponentId;
 
 #[derive(Clone, Debug)]
 pub enum Message {
@@ -14,7 +15,7 @@ pub enum Message {
         inner: Option<Value>,
         inner_type: Option<TypeId>,
 
-        sender: Option<Uuid>,
+        sender: Option<ComponentId>,
     },
     Call {
         callback_id: String,
@@ -22,13 +23,15 @@ pub enum Message {
         inner: Option<Value>,
         inner_type: Option<TypeId>,
 
-        caller_id: Uuid,
-        response_tx: mpsc::Sender<Value>,
+        response_type: Option<TypeId>,
+
+        caller_id: ComponentId,
+        response_tx: mpsc::Sender<Result<Value>>,
     },
 }
 
 impl Message {
-    pub fn new_broadcast<S, T>(id: S, data: Option<T>, sender: Option<Uuid>) -> Result<Self>
+    pub fn new_broadcast<S, T>(id: S, data: Option<T>, sender: Option<ComponentId>) -> Result<Self>
     where
         S: ToString,
         for<'a> T: Any + Serialize + Deserialize<'a>,
@@ -53,15 +56,16 @@ impl Message {
         }
     }
 
-    pub fn new_call<S, T>(
+    pub fn new_call<S, T, R>(
         id: S,
         data: Option<T>,
-        caller_id: Uuid,
-        response_channel: mpsc::Sender<Value>,
+        caller_id: ComponentId,
+        response_channel: mpsc::Sender<Result<Value>>,
     ) -> Result<Self>
     where
         S: ToString,
         for<'a> T: Any + Serialize + Deserialize<'a>,
+        for<'b> R: Any + Serialize + Deserialize<'b>,
     {
         if let Some(data) = data {
             let inner = Some(serde_json::to_value(&data)?);
@@ -73,6 +77,8 @@ impl Message {
                 inner,
                 inner_type,
 
+                response_type: Some(TypeId::of::<R>()),
+
                 caller_id,
                 response_tx: response_channel,
             })
@@ -82,6 +88,8 @@ impl Message {
 
                 inner: None,
                 inner_type: None,
+
+                response_type: Some(TypeId::of::<R>()),
 
                 caller_id,
                 response_tx: response_channel,
@@ -94,7 +102,9 @@ impl Message {
         for<'a> R: Any + Serialize + Deserialize<'a>,
     {
         if let Message::Call { response_tx, .. } = self {
-            response_tx.send(serde_json::to_value(response)?).await;
+            response_tx
+                .send(Ok(serde_json::to_value(response)?))
+                .await?;
         }
 
         Ok(())

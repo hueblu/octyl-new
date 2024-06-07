@@ -11,23 +11,23 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::message::Message;
+
 pub struct Tui {
     pub terminal: ratatui::Terminal<Backend<Stderr>>,
+
     pub task: JoinHandle<()>,
     pub cancellation_token: CancellationToken,
-    pub event_rx: mpsc::UnboundedReceiver<Event>,
 }
 
 impl Tui {
-    pub fn new() -> Result<Self> {
+    pub fn new(public_tx: mpsc::UnboundedSender<Message>) -> Result<Self> {
         enable_raw_mode()?;
         // crossterm::execute!(stderr(), crossterm::terminal::EnterAlternateScreen)?;
         let terminal = Terminal::new(Backend::new(stderr()))?;
 
         let cancellation_token = CancellationToken::new();
         let _cancellation_token = cancellation_token.clone();
-
-        let (event_tx, event_rx) = mpsc::unbounded_channel::<Event>();
 
         let task = spawn(async move {
             let mut event_stream = crossterm::event::EventStream::new();
@@ -41,7 +41,8 @@ impl Tui {
                     }
                     maybe_event = event_future => {
                         if let Some(Ok(evt)) = maybe_event {
-                            event_tx.send(evt).unwrap();
+                            //TODO: error handling
+                            let _ = public_tx.send(Message::from(evt));
                         }
                     }
                 }
@@ -52,11 +53,21 @@ impl Tui {
             terminal,
             task,
             cancellation_token,
-            event_rx,
         })
     }
+}
 
-    pub async fn recv(&mut self) -> Option<Event> {
-        self.event_rx.recv().await
+impl From<Event> for Message {
+    fn from(value: Event) -> Self {
+        let id = match value {
+            Event::Key(_) => "terminal.event.key",
+            Event::Mouse(_) => "terminal.event.key",
+            Event::Paste(_) => "terminal.event.paste",
+            Event::Resize(_, _) => "terminal.event.resize",
+            Event::FocusLost => "terminal.event.focuslost",
+            Event::FocusGained => "terminal.event.focusgained",
+        };
+
+        Message::new_broadcast(id, Some(value), None).unwrap()
     }
 }

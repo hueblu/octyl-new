@@ -1,70 +1,61 @@
-use std::{any::Any, marker::PhantomData};
+use std::{
+    any::Any,
+    ops::{Deref, DerefMut},
+};
 
 use anyhow::{bail, Result};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::{
-    sync::{broadcast, mpsc},
-    task::JoinHandle,
-};
+use tokio::{sync::mpsc, task::JoinHandle};
 use uuid::Uuid;
 
 use crate::message::Message;
 
-pub type Callback = Box<dyn FnMut(Option<Value>) -> Result<Option<Value>>>;
-
-pub trait Component: Sync + Send {
-    fn run(
-        &mut self,
-        cx: Context,
-    ) -> impl std::future::Future<Output = Result<()>> + std::marker::Send;
+pub trait LocalComponent: Sync + Send {
+    fn run(&mut self, cx: Context) -> impl std::future::Future<Output = Result<()>> + Send;
 }
 
-// broadcasted messages from components are like:
-// "component id"."message detail"."message detail"...
 pub struct Context {
-    public_tx: broadcast::Sender<Message>,
+    public_tx: mpsc::UnboundedSender<Message>,
 
     private_tx: mpsc::Sender<Message>,
     private_rx: mpsc::Receiver<Message>,
 
-    uuid: Uuid,
+    id: ComponentId,
 }
 
-pub struct MountedComponent {
+pub struct ComponentHandler {
     thread: JoinHandle<()>,
     private_tx: mpsc::Sender<Message>,
 
-    uuid: Uuid,
+    id: ComponentId,
 }
 
-#[derive(Debug)]
-pub struct CallReciever<'a, R: Any + Serialize + Deserialize<'a>> {
-    phantom_data: PhantomData<&'a R>,
-
-    inner: mpsc::Receiver<Value>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ComponentId {
+    inner: Uuid,
 }
 
 impl Context {
     pub fn new(
-        public_tx: broadcast::Sender<Message>,
+        public_tx: mpsc::UnboundedSender<Message>,
         private_tx: mpsc::Sender<Message>,
         private_rx: mpsc::Receiver<Message>,
-        uuid: Uuid,
+        id: ComponentId,
     ) -> Self {
         Self {
             public_tx,
             private_tx,
             private_rx,
-            uuid,
+            id,
         }
     }
 
-    pub fn set_message_subscriptions(&mut self) {}
+    pub fn add_broadcast_subscription(&mut self, id: String) -> Result<()> {
+        Ok(())
+    }
 
-    pub fn get_event_stream(&mut self) {}
-
-    pub fn add_call(&mut self, id: String, callback: Callback) -> Result<()> {
+    pub fn add_call_subscription(&mut self, id: String) -> Result<()> {
         Ok(())
     }
 
@@ -74,7 +65,7 @@ impl Context {
         for<'a> T: Any + Serialize + Deserialize<'a>,
     {
         self.public_tx
-            .send(Message::new_broadcast(id, data, Some(self.uuid))?)?;
+            .send(Message::new_broadcast(id, data, Some(self.id))?)?;
         Ok(())
     }
 
@@ -87,21 +78,24 @@ impl Context {
         for<'a> T: Any + Serialize + Deserialize<'a>,
         for<'b> R: Any + Serialize + Deserialize<'b>,
     {
-        let (response_tx, mut response_rx) = mpsc::channel::<Value>(10);
+        let (response_tx, mut response_rx) = mpsc::channel::<Result<Value>>(10);
 
-        self.public_tx.send(Message::new_call(
+        self.public_tx.send(Message::new_call::<_, T, R>(
             callback_id,
             data,
-            self.uuid,
+            self.id,
             response_tx,
         )?)?;
         match response_rx.recv().await {
-            Some(Value::Null) => Ok(None),
-            Some(data) if let Ok(result) = serde_json::from_value::<R>(data.clone()) => {
+            Some(Ok(Value::Null)) => Ok(None),
+            Some(Ok(data)) if let Ok(result) = serde_json::from_value::<R>(data.clone()) => {
                 Ok(Some(result))
             }
-            Some(data) => {
+            Some(Ok(data)) => {
                 bail!("failed to parse return value: {}", data);
+            }
+            Some(Err(e)) => {
+                bail!(e)
             }
             None => Ok(None),
         }
@@ -112,60 +106,63 @@ impl Context {
     }
 }
 
-impl MountedComponent {
+impl ComponentHandler {
     pub fn new(
-        mut component: impl Component + 'static,
-        message_tx: broadcast::Sender<Message>,
-    ) -> (Uuid, Self) {
+        mut component: impl LocalComponent + 'static,
+        public_tx: mpsc::UnboundedSender<Message>,
+    ) -> Self {
         let (private_tx, private_rx) = mpsc::channel::<Message>(100);
-        let uuid = Uuid::new_v4();
-        let context = Context::new(message_tx, private_tx.clone(), private_rx, uuid);
+        let id = ComponentId::new();
+        let context = Context::new(public_tx, private_tx.clone(), private_rx, id);
 
         let thread = tokio::spawn(async move {
-            //TODO: error handling
-            component.run(context).await;
+            let _ = component.run(context).await;
         });
 
-        (
-            uuid,
-            Self {
-                thread,
-                private_tx,
-                uuid,
-            },
-        )
-    }
-
-    pub fn uuid(&self) -> Uuid {
-        self.uuid
-    }
-
-    pub fn handle_message(&self, message: Message) {
-        // if matches subscriptions: send to component
-    }
-}
-
-impl<'a, R> CallReciever<'a, R>
-where
-    R: Any + Serialize + DeserializeOwned,
-{
-    pub async fn recv(&mut self) -> Result<Option<R>> {
-        if let Some(data) = self.inner.recv().await {
-            Ok(Some(serde_json::from_value::<R>(data)?))
-        } else {
-            Ok(None)
-        }
-    }
-}
-
-impl<'a, R> From<mpsc::Receiver<Value>> for CallReciever<'a, R>
-where
-    R: Any + Serialize + Deserialize<'a>,
-{
-    fn from(value: mpsc::Receiver<Value>) -> CallReciever<'a, R> {
         Self {
-            phantom_data: PhantomData,
-            inner: value,
+            thread,
+            private_tx,
+            id,
         }
+    }
+
+    pub fn id(&self) -> ComponentId {
+        self.id
+    }
+
+    pub fn handle_message(&self, message: Message) {}
+}
+
+impl ComponentId {
+    pub fn new() -> Self {
+        Self {
+            inner: Uuid::new_v4(),
+        }
+    }
+}
+
+impl Default for ComponentId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl From<Uuid> for ComponentId {
+    fn from(value: Uuid) -> Self {
+        Self { inner: value }
+    }
+}
+
+impl Deref for ComponentId {
+    type Target = Uuid;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for ComponentId {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
     }
 }
