@@ -7,4 +7,3 @@ pub mod app;
 mod component;
 mod local_components;
 mod message;
-mod tui;

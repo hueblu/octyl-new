@@ -1,4 +1,5 @@
 use anyhow::Result;
+use tokio_util::sync::CancellationToken;
 
 use crate::component::LocalComponent;
 
@@ -18,7 +19,11 @@ impl Editor {
 }
 
 impl LocalComponent for Editor {
-    async fn run(&mut self, mut cx: crate::component::Context) -> Result<()> {
+    async fn run(
+        &mut self,
+        mut cx: crate::component::Context,
+        cancel_token: CancellationToken,
+    ) -> Result<()> {
         cx.call::<String, ()>("core.print", Some("editor online".to_string()))
             .await?;
 
